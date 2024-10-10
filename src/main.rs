@@ -2,10 +2,11 @@
 //
 // This code focuses on the case where the posts are focused on displaying photos.
 
-use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
+use base64::Engine;
+use chrono::{DateTime, FixedOffset, NaiveDate};
 use clap::Parser;
-use lol_html::{rewrite_str, element, RewriteStrSettings};
+use lol_html::{element, rewrite_str, RewriteStrSettings};
 use quoted_printable;
 use regex::bytes::Regex;
 use scraper::{Html, Selector};
@@ -19,7 +20,7 @@ use std::vec::Vec;
 
 /// Generate a site from a directory of Google Group MHTML files.
 #[derive(Parser)]
-#[command(rename_all="snake_case")]
+#[command(rename_all = "snake_case")]
 struct Cli {
     /// Path to the directory of .mhtml files.
     #[arg(short, long, value_name = "DIR")]
@@ -38,20 +39,22 @@ struct GroupsPost {
     /// HTML fragment for the main post.
     html: String,
     /// URLs of images used within post_html.
-    image_urls: Vec<String>
+    image_urls: Vec<String>,
 }
 
 #[derive(Default)]
 struct Page {
     title: String,
     /// Date on which the content was scraped
-    scrape_date_str: String,
+    scrape_date: DateTime<FixedOffset>,
+    /// Best guess as to when it was originally posted.
+    post_date: NaiveDate,
     /// Original URL at which the post appeared.
     original_url: String,
     /// Name within output dir.
     output_file: String,
     /// Name within output dir.
-    images_dir: String
+    images_dir: String,
 }
 
 #[derive(Default)]
@@ -87,10 +90,15 @@ fn decode_base64_containing_whitespace(data: &[u8]) -> Vec<u8> {
 
 fn datetime_str_from_html(html: &[u8]) -> Option<String> {
     static DATETIME_RE_LOCK: OnceLock<Regex> = OnceLock::new();
-    let datetime_re = DATETIME_RE_LOCK.get_or_init(|| Regex::new(r#"<span[^>]*>\s*(?P<date>[^<>]+\(\d+ (?:hour|day)s? ago\))[^<>]+</span>"#).unwrap());
+    let datetime_re = DATETIME_RE_LOCK.get_or_init(|| {
+        Regex::new(r#"<span[^>]*>\s*(?P<date>[^<>]+\(\d+ (?:hour|day)s? ago\))[^<>]+</span>"#)
+            .unwrap()
+    });
     let captures = datetime_re.captures(html)?;
     // u202F = NARROW NO-BREAK SPACE
-    let datetime_str = utf8_bytes_to_string(&captures["date"]).replace("\u{202F}", " ").replace("&nbsp;", " ");
+    let datetime_str = utf8_bytes_to_string(&captures["date"])
+        .replace("\u{202F}", " ")
+        .replace("&nbsp;", " ");
     return Some(String::from(datetime_str.trim()));
 }
 
@@ -103,7 +111,7 @@ fn parse_groups_post(html: &[u8]) -> Result<GroupsPost, io::Error> {
         return Err(invalid_data_err("Post has no section[role=listitem]"));
     };
     if let Some(author) = section.value().attr("data-author") {
-            post.author = Some(String::from(author));
+        post.author = Some(String::from(author));
     };
     let region_selector = Selector::parse(r#"[role="region"]"#).unwrap();
     let Some(region) = section.select(&region_selector).next() else {
@@ -112,7 +120,8 @@ fn parse_groups_post(html: &[u8]) -> Result<GroupsPost, io::Error> {
     let img_selector = Selector::parse("img").unwrap();
     for img in region.select(&img_selector) {
         if let Some(src) = img.attr("src") {
-            post.image_urls.push(String::from(src).replace("&amp;", "&"));
+            post.image_urls
+                .push(String::from(src).replace("&amp;", "&"));
         }
     }
     post.html = region.inner_html();
@@ -121,9 +130,15 @@ fn parse_groups_post(html: &[u8]) -> Result<GroupsPost, io::Error> {
 
 fn parse_mhtml_piece(text: &[u8]) -> Result<MhtmlPiece, io::Error> {
     static SECTION_RE_LOCK: OnceLock<Regex> = OnceLock::new();
-    let section_re = SECTION_RE_LOCK.get_or_init(|| Regex::new(r#"^Content-Type: (?P<content_type>\S+)\s*
-(?:Content-ID: \S+\s+)?Content-Transfer-Encoding: (?P<encoding>\S+)\s*
-Content-Location: (?P<location>\S+)\s*"#).unwrap());
+    let section_re = SECTION_RE_LOCK.get_or_init(|| {
+        Regex::new(
+            r#"(?x)^Content-Type:\s(?P<content_type>\S+)\s*
+(?:Content-ID:\s\S+\s+)?
+Content-Transfer-Encoding:\s(?P<encoding>\S+)\s*
+Content-Location:\s(?P<location>\S+)\s*"#,
+        )
+        .unwrap()
+    });
     let Some(captures) = section_re.captures(text) else {
         println!("Problem parsing: <<{}>>", utf8_bytes_to_str(text));
         return Err(invalid_data_err("MHTML piece doesn't have expected header"));
@@ -135,8 +150,10 @@ Content-Location: (?P<location>\S+)\s*"#).unwrap());
     let encoding = utf8_bytes_to_str(&captures["encoding"]);
     piece.bytes = match encoding {
         "base64" => decode_base64_containing_whitespace(remainder),
-        "quoted-printable" => quoted_printable::decode(remainder, quoted_printable::ParseMode::Strict).unwrap(),
-        _ => panic!("Unknown encoding {} for {}", &encoding, &piece.location)
+        "quoted-printable" => {
+            quoted_printable::decode(remainder, quoted_printable::ParseMode::Strict).unwrap()
+        }
+        _ => panic!("Unknown encoding {} for {}", &encoding, &piece.location),
     };
 
     Ok(piece)
@@ -150,29 +167,36 @@ fn parse_post_from_mhtml_piece(text: &[u8]) -> Result<GroupsPost, io::Error> {
     return parse_groups_post(&piece.bytes);
 }
 
-fn make_origin_date_str(scrape_date: &String, post_date: &String) -> String {
-    if post_date.contains("hour") {
-        return scrape_date.clone();
+fn parse_origin_date(scrape_date: &DateTime<FixedOffset>, post_date: &Option<String>) -> NaiveDate {
+    if let Some(post_date_str) = &post_date {
+        if post_date_str.contains("day") {
+            if let Some(left_paren) = post_date_str.find(" (") {
+                let prefix: String = post_date_str.chars().take(left_paren).collect();
+                let (date, _remainder) =
+                    NaiveDate::parse_and_remainder(&prefix.as_str(), "%b %d, %Y").unwrap();
+                return date;
+            }
+        }
     }
-    if let Some(left_paren) = post_date.find(" (") {
-        return post_date.chars().take(left_paren).collect();
-    }
-    post_date.clone()
+    return scrape_date.naive_local().date();
 }
 
-fn make_output_html_for_post(post: &GroupsPost, page: &Page, image_to_path: &HashMap<String, String>) -> String {
-    // Rewrite image links and strip attributes.
+fn make_output_html_for_post(
+    post: &GroupsPost,
+    page: &Page,
+    image_to_path: &HashMap<String, String>,
+) -> String {
     let element_content_handlers = vec![
+        // Rewrite image links to point to local copies if available.
         element!("img[src]", |el| {
-            let src = el
-                .get_attribute("src")
-                .unwrap().replace("&amp;", "&");
+            let src = el.get_attribute("src").unwrap().replace("&amp;", "&");
             if let Some(path) = image_to_path.get(&src) {
                 el.set_attribute("src", &path).unwrap();
             }
 
             Ok(())
         }),
+        // Strip attributes other than href and src.
         element!("*", |el| {
             let attribute_names: Vec<String> = el.attributes().iter().map(|x| x.name()).collect();
             for attribute in attribute_names {
@@ -189,17 +213,17 @@ fn make_output_html_for_post(post: &GroupsPost, page: &Page, image_to_path: &Has
         RewriteStrSettings {
             element_content_handlers,
             ..RewriteStrSettings::new()
-        }
-    ).unwrap();
+        },
+    )
+    .unwrap();
     let mut info_pieces: Vec<String> = Vec::new();
     if let Some(author) = &post.author {
         info_pieces.push(author.clone());
     }
-    if let Some(post_date) = &post.datetime_str {
-        info_pieces.push(make_origin_date_str(&page.scrape_date_str, &post_date));
-    }
+    info_pieces.push(page.post_date.format("%b %d, %Y").to_string());
 
-    format!(r#"<!DOCTYPE html>
+    format!(
+        r#"<!DOCTYPE html>
 <html lang='en'>
     <head>
         <title>{title}</title>
@@ -214,23 +238,32 @@ fn make_output_html_for_post(post: &GroupsPost, page: &Page, image_to_path: &Has
         </p>
     </body>
 </html>"#,
-        post_html=output_post_html,
-        title=page.title,
-        info=info_pieces.join(", "),
-        scrape_date=page.scrape_date_str,
-        original_url=page.original_url)
+        post_html = output_post_html,
+        title = page.title,
+        info = info_pieces.join(", "),
+        scrape_date = page.scrape_date,
+        original_url = page.original_url
+    )
 }
 
-fn create_page_from_mhtml(path: &std::path::PathBuf, output_dir: &std::path::PathBuf) -> Result<Page, io::Error> {
+fn create_page_from_mhtml(
+    path: &std::path::PathBuf,
+    output_dir: &std::path::PathBuf,
+) -> Result<Page, io::Error> {
     static HEADER_RE_LOCK: OnceLock<Regex> = OnceLock::new();
-    let header_re = HEADER_RE_LOCK.get_or_init(|| Regex::new(r#"^From: [^\n]+
-Snapshot-Content-Location: (?P<location>[^\n]+)
-Subject: (?P<subject>[^\n]+)
-Date: (?<scrape_date>[^\n]+)
-MIME-Version: [^\n]+
-Content-Type: [^\n]+
-\s+type=[^\n]+
-\s+boundary="(?P<boundary>[^"]+)""#).unwrap());
+    let header_re = HEADER_RE_LOCK.get_or_init(|| {
+        Regex::new(
+            r#"(?x)^From:\s[^\r\n]+\s*
+Snapshot-Content-Location:\s(?P<location>[^\r\n]+)\s*
+Subject:\s(?P<subject>[^\r\n]+)\s*
+Date:\s(?<scrape_date>[^\r\n]+)\s*
+MIME-Version:\s[^\r\n]+\s*
+Content-Type:\s[^\r\n]+\s*
+\s+type=[^\r\n]+
+\s+boundary="(?P<boundary>[^"]+)""#,
+        )
+        .unwrap()
+    });
 
     let mut page: Page = Default::default();
     let contents = fs::read(path)?;
@@ -239,13 +272,18 @@ Content-Type: [^\n]+
         return Err(invalid_data_err("MHTML doesn't have expected header"));
     };
     page.title = utf8_bytes_to_string(&header_captures["subject"]);
-    page.scrape_date_str = utf8_bytes_to_string(&header_captures["scrape_date"]);
+    page.scrape_date =
+        DateTime::parse_from_rfc2822(&utf8_bytes_to_str(&header_captures["scrape_date"])).unwrap();
     page.original_url = utf8_bytes_to_string(&header_captures["location"]);
 
     let mut flattened_title = page.title.replace("/", "_").replace(" ", "_");
     flattened_title.retain(|c| c.is_ascii_alphanumeric() || c == '_');
     flattened_title.make_ascii_lowercase();
-    let basename = format!("{}_{:x}", flattened_title, calculate_hash(&page.original_url));
+    let basename = format!(
+        "{}_{:x}",
+        flattened_title,
+        calculate_hash(&page.original_url)
+    );
     page.output_file = format!("{}.html", basename);
     page.images_dir = format!("{}_images", basename);
 
@@ -273,10 +311,14 @@ Content-Type: [^\n]+
         if piece.content_type == "image/jpeg" && post.image_urls.contains(&piece.location) {
             num_images += 1;
             let filename = format!("{:03}.jpeg", num_images);
-            image_to_path.insert(piece.location, format!("{}/{}", &page.images_dir, &filename));
+            image_to_path.insert(
+                piece.location,
+                format!("{}/{}", &page.images_dir, &filename),
+            );
             fs::write(images_dir.join(&filename), &piece.bytes)?;
         }
     }
+    page.post_date = parse_origin_date(&page.scrape_date, &post.datetime_str);
 
     let output_html = make_output_html_for_post(&post, &page, &image_to_path);
     fs::write(output_dir.join(&page.output_file), &output_html.as_bytes())?;
@@ -289,15 +331,58 @@ struct Site {
     num_pages: i32,
 }
 
-fn create_site_from_mhtml_dir(input_dir: &std::path::PathBuf, output_dir: &std::path::PathBuf) -> Result<Site, io::Error> {
-    let mut site = Site { num_pages: 0};
+fn make_pages_index_html(pages: &Vec<Page>) -> String {
+    let mut items: Vec<String> = Vec::new();
+    for page in pages {
+        items.push(format!(
+            r#"<li> <a href="{}">{}</a> ({})"#,
+            page.output_file,
+            page.title,
+            page.post_date.format("%b %d, %Y").to_string()
+        ));
+    }
+
+    format!(
+        r#"<!DOCTYPE html>
+    <html lang='en'>
+        <head>
+            <title>Posts Index</title>
+        <meta charset='utf-8'>
+        </head>
+        <body>
+            <h1>Posts Index</h1>
+            <ul>
+                {}
+            </ul>
+        </body>
+    </html>"#,
+        items.join("")
+    )
+}
+
+fn create_site_from_mhtml_dir(
+    input_dir: &std::path::PathBuf,
+    output_dir: &std::path::PathBuf,
+) -> Result<Site, io::Error> {
+    let mut site = Site { num_pages: 0 };
+    let mut pages: Vec<Page> = Vec::new();
     for entry in fs::read_dir(input_dir)? {
         let entry = entry?;
         if entry.file_name().to_str().unwrap().ends_with(".mhtml") {
-            let page = create_page_from_mhtml(&entry.path(), output_dir)?;
+            pages.push(create_page_from_mhtml(&entry.path(), output_dir)?);
             site.num_pages += 1;
         }
     }
+    pages.sort_by(|a, b| {
+        if a.post_date == b.post_date {
+            a.title.partial_cmp(&b.title).unwrap()
+        } else {
+            a.post_date.partial_cmp(&b.post_date).unwrap()
+        }
+    });
+    let index_html = make_pages_index_html(&pages);
+    fs::write(output_dir.join("index.html"), index_html.as_bytes())?;
+
     Ok(site)
 }
 
@@ -305,7 +390,11 @@ fn main() {
     let args = Cli::parse();
     fs::create_dir_all(&args.output_dir).unwrap();
     let site = create_site_from_mhtml_dir(&args.input_dir, &args.output_dir).unwrap();
-    println!("Generated {:?} pages under {:?}", site.num_pages, args.output_dir.display());
+    println!(
+        "Generated {:?} pages under {:?}",
+        site.num_pages,
+        args.output_dir.display()
+    );
 }
 
 #[cfg(test)]
@@ -313,9 +402,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_datetime_str_from_html() {
+    fn parse_origin_date_hours_ago() {
+        let scrape_date = DateTime::parse_from_rfc2822("Mon, 7 Oct 2024 09:08:15 -0700").unwrap();
+        let result = parse_origin_date(&scrape_date, &Some(String::from("5:29 AM (5 hours ago)")));
+        assert_eq!(result, NaiveDate::from_ymd_opt(2024, 10, 7).unwrap());
+    }
+
+    #[test]
+    fn parse_origin_date_missing_post_date() {
+        let scrape_date = DateTime::parse_from_rfc2822("Mon, 7 Oct 2024 10:09:30 -0700").unwrap();
+        let result = parse_origin_date(&scrape_date, &None);
+        assert_eq!(result, NaiveDate::from_ymd_opt(2024, 10, 7).unwrap());
+    }
+
+    #[test]
+    fn parse_origin_date_days_ago() {
+        let scrape_date = DateTime::parse_from_rfc2822("Mon, 7 Oct 2024 10:09:30 -0700").unwrap();
+        let result = parse_origin_date(
+            &scrape_date,
+            &Some(String::from("Oct 3, 2024, 9:55:19 AM (7 days ago)")),
+        );
+        assert_eq!(result, NaiveDate::from_ymd_opt(2024, 10, 3).unwrap());
+    }
+
+    #[test]
+    fn datetime_str_from_html_1_hour_ago() {
         let input = r#"<span class="zX2W9c">5:29 AM&nbsp;(1 hour ago)&nbsp;</span>"#.as_bytes();
         let result = datetime_str_from_html(input);
         assert_eq!(result, Some(String::from("5:29 AM (1 hour ago)")));
+    }
+
+    #[test]
+    fn datetime_str_from_html_2_days_ago() {
+        let input =
+            r#"<span class="zX2W9c">Oct 8, 2024, 5:10:58 AM&nbsp;(2 days ago)&nbsp;</span>"#
+                .as_bytes();
+        let result = datetime_str_from_html(input);
+        assert_eq!(
+            result,
+            Some(String::from("Oct 8, 2024, 5:10:58 AM (2 days ago)"))
+        );
     }
 }

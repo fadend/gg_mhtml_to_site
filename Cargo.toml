@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 base64 = "0.22.1"
 clap = { version = "4.0", features = ["derive"] }
+chrono = "0.4.38"
 lol_html = "=2.0.0"
 memmem = "0.1.1"
 quoted_printable = "0.5.1"
