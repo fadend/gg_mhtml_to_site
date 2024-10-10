@@ -1,0 +1,15 @@
+[package]
+name = "gg_mhtml_to_site"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+base64 = "0.22.1"
+clap = { version = "4.0", features = ["derive"] }
+lol_html = "=2.0.0"
+memmem = "0.1.1"
+quoted_printable = "0.5.1"
+regex = "1.11.0"
+scraper = "0.20.0"
