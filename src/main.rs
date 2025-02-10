@@ -34,8 +34,8 @@ struct Cli {
 #[derive(Default)]
 struct GroupsPost {
     author: Option<String>,
-    /// May be relative to current time, e.g., "5:39 AM (8 hours ago)"
-    datetime_str: Option<String>,
+    /// Date extracted from the post.
+    date: Option<NaiveDate>,
     /// HTML fragment for the main post.
     html: String,
     /// URLs of images used within post_html.
@@ -45,7 +45,7 @@ struct GroupsPost {
 #[derive(Default)]
 struct Page {
     title: String,
-    /// Date on which the content was scraped
+    /// Date on which the content was scraped.
     scrape_date: DateTime<FixedOffset>,
     /// Best guess as to when it was originally posted.
     post_date: NaiveDate,
@@ -88,23 +88,34 @@ fn decode_base64_containing_whitespace(data: &[u8]) -> Vec<u8> {
     BASE64_STANDARD.decode(copy).unwrap()
 }
 
-fn datetime_str_from_html(html: &[u8]) -> Option<String> {
+fn date_from_title(title: &[u8]) -> Option<NaiveDate> {
+    static DATE_RE_LOCK: OnceLock<Regex> = OnceLock::new();
+    let date_re = DATE_RE_LOCK
+        .get_or_init(|| Regex::new(r#"(?P<month>\d+)/(?P<day>\d+)/(?P<year>\d+)"#).unwrap());
+    let captures = date_re.captures(title)?;
+    let year: i32 = utf8_bytes_to_str(&captures["year"]).parse().unwrap();
+    let month: u32 = utf8_bytes_to_str(&captures["month"]).parse().unwrap();
+    let day: u32 = utf8_bytes_to_str(&captures["day"]).parse().unwrap();
+    let full_year = if year < 100 { year + 2000 } else { year };
+    return NaiveDate::from_ymd_opt(full_year, month, day);
+}
+
+fn date_from_html(html: &[u8]) -> Option<NaiveDate> {
     static DATETIME_RE_LOCK: OnceLock<Regex> = OnceLock::new();
     let datetime_re = DATETIME_RE_LOCK.get_or_init(|| {
-        Regex::new(r#"<span[^>]*>\s*(?P<date>[^<>]+\(\d+ (?:hour|day)s? ago\))[^<>]+</span>"#)
+        Regex::new(r#"<span[^>]*>\s*(?P<date>[A-Z][a-z]{2} \d+, \d{4}, \d{1,2}:\d\d:\d\d[^<]+(?:AM|PM))</span>"#)
             .unwrap()
     });
     let captures = datetime_re.captures(html)?;
     // u202F = NARROW NO-BREAK SPACE
-    let datetime_str = utf8_bytes_to_string(&captures["date"])
-        .replace("\u{202F}", " ")
-        .replace("&nbsp;", " ");
-    return Some(String::from(datetime_str.trim()));
+    let datetime_str = utf8_bytes_to_string(&captures["date"]);
+    let (date, _remainder) = NaiveDate::parse_and_remainder(&datetime_str, "%b %d, %Y").unwrap();
+    return Some(date);
 }
 
 fn parse_groups_post(html: &[u8]) -> Result<GroupsPost, io::Error> {
     let mut post: GroupsPost = Default::default();
-    post.datetime_str = datetime_str_from_html(html);
+    post.date = date_from_html(html);
     let fragment = Html::parse_fragment(&utf8_bytes_to_str(html));
     let listitem_selector = Selector::parse(r#"section[role="listitem"]"#).unwrap();
     let Some(section) = fragment.select(&listitem_selector).next() else {
@@ -165,20 +176,6 @@ fn parse_post_from_mhtml_piece(text: &[u8]) -> Result<GroupsPost, io::Error> {
         return Err(invalid_data_err("Expecting text/html"));
     }
     return parse_groups_post(&piece.bytes);
-}
-
-fn parse_origin_date(scrape_date: &DateTime<FixedOffset>, post_date: &Option<String>) -> NaiveDate {
-    if let Some(post_date_str) = &post_date {
-        if post_date_str.contains("day") {
-            if let Some(left_paren) = post_date_str.find(" (") {
-                let prefix: String = post_date_str.chars().take(left_paren).collect();
-                let (date, _remainder) =
-                    NaiveDate::parse_and_remainder(&prefix.as_str(), "%b %d, %Y").unwrap();
-                return date;
-            }
-        }
-    }
-    return scrape_date.naive_local().date();
 }
 
 fn make_output_html_for_post(
@@ -318,7 +315,13 @@ Content-Type:\s[^\r\n]+\s*
             fs::write(images_dir.join(&filename), &piece.bytes)?;
         }
     }
-    page.post_date = parse_origin_date(&page.scrape_date, &post.datetime_str);
+    if let Some(post_date) = post.date {
+        page.post_date = post_date;
+    } else if let Some(title_date) = date_from_title(&header_captures["subject"]) {
+        page.post_date = title_date;
+    } else {
+        page.post_date = page.scrape_date.naive_local().date();
+    }
 
     let output_html = make_output_html_for_post(&post, &page, &image_to_path);
     fs::write(output_dir.join(&page.output_file), &output_html.as_bytes())?;
@@ -369,6 +372,7 @@ fn create_site_from_mhtml_dir(
     for entry in fs::read_dir(input_dir)? {
         let entry = entry?;
         if entry.file_name().to_str().unwrap().ends_with(".mhtml") {
+            println!("Processing {:?}", &entry.path());
             pages.push(create_page_from_mhtml(&entry.path(), output_dir)?);
             site.num_pages += 1;
         }
@@ -402,45 +406,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_origin_date_hours_ago() {
-        let scrape_date = DateTime::parse_from_rfc2822("Mon, 7 Oct 2024 09:08:15 -0700").unwrap();
-        let result = parse_origin_date(&scrape_date, &Some(String::from("5:29 AM (5 hours ago)")));
-        assert_eq!(result, NaiveDate::from_ymd_opt(2024, 10, 7).unwrap());
-    }
-
-    #[test]
-    fn parse_origin_date_missing_post_date() {
-        let scrape_date = DateTime::parse_from_rfc2822("Mon, 7 Oct 2024 10:09:30 -0700").unwrap();
-        let result = parse_origin_date(&scrape_date, &None);
-        assert_eq!(result, NaiveDate::from_ymd_opt(2024, 10, 7).unwrap());
-    }
-
-    #[test]
-    fn parse_origin_date_days_ago() {
-        let scrape_date = DateTime::parse_from_rfc2822("Mon, 7 Oct 2024 10:09:30 -0700").unwrap();
-        let result = parse_origin_date(
-            &scrape_date,
-            &Some(String::from("Oct 3, 2024, 9:55:19 AM (7 days ago)")),
-        );
-        assert_eq!(result, NaiveDate::from_ymd_opt(2024, 10, 3).unwrap());
-    }
-
-    #[test]
-    fn datetime_str_from_html_1_hour_ago() {
-        let input = r#"<span class="zX2W9c">5:29 AM&nbsp;(1 hour ago)&nbsp;</span>"#.as_bytes();
-        let result = datetime_str_from_html(input);
-        assert_eq!(result, Some(String::from("5:29 AM (1 hour ago)")));
-    }
-
-    #[test]
-    fn datetime_str_from_html_2_days_ago() {
-        let input =
-            r#"<span class="zX2W9c">Oct 8, 2024, 5:10:58 AM&nbsp;(2 days ago)&nbsp;</span>"#
-                .as_bytes();
-        let result = datetime_str_from_html(input);
+    fn date_from_title_yy() {
         assert_eq!(
-            result,
-            Some(String::from("Oct 8, 2024, 5:10:58 AM (2 days ago)"))
+            date_from_title(b"7/19/23"),
+            NaiveDate::from_ymd_opt(2023, 7, 19)
+        );
+    }
+
+    #[test]
+    fn date_from_title_yyyy() {
+        assert_eq!(
+            date_from_title(b"7/19/2023"),
+            NaiveDate::from_ymd_opt(2023, 7, 19)
+        );
+    }
+
+    #[test]
+    fn date_from_html_missing() {
+        assert_eq!(date_from_html(b""), None);
+    }
+
+    #[test]
+    fn date_from_html_pm() {
+        assert_eq!(
+            date_from_html(br#"<span class="zX2W9c">Jul 13, 2023, 7:31:18\u{202F}PM</span>"#),
+            NaiveDate::from_ymd_opt(2023, 7, 13)
         );
     }
 }
