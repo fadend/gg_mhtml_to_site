@@ -26,6 +26,7 @@ use std::sync::OnceLock;
 use std::vec::Vec;
 
 const NUM_THUMBNAILS: i32 = 3;
+const THUMBNAIL_HEIGHT: u32 = 150;
 
 const INITIAL_TEXT_MAX_LEN: usize = 140;
 
@@ -263,7 +264,11 @@ fn create_thumbnail(contents: &[u8], thumbnail_path: &std::path::PathBuf) {
         .with_guessed_format()
         .unwrap();
     let image = reader.decode().unwrap();
-    let thumbnail = imageops::thumbnail(&image, 150, 150);
+    let original_height = image.height();
+    let original_width = image.width();
+    let width =
+        ((original_width as f32) / (original_height as f32) * THUMBNAIL_HEIGHT as f32) as u32;
+    let thumbnail = imageops::thumbnail(&image, width, THUMBNAIL_HEIGHT);
     image::DynamicImage::ImageRgba8(thumbnail)
         .into_rgb8()
         .save(thumbnail_path)
