@@ -6,17 +6,28 @@ use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use clap::Parser;
+// Using feature "unescape"
+use htmlize;
+use image;
+use image::imageops;
 use lol_html::{element, rewrite_str, RewriteStrSettings};
 use quoted_printable;
 use regex::bytes::Regex;
 use scraper::{Html, Selector};
+// Adds unicode_truncate method to str.
+use unicode_truncate::UnicodeTruncateStr;
 
 use std::collections::HashMap;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
+use std::io::Cursor;
 use std::sync::OnceLock;
 use std::vec::Vec;
+
+const NUM_THUMBNAILS: i32 = 3;
+
+const INITIAL_TEXT_MAX_LEN: usize = 140;
 
 /// Generate a site from a directory of Google Group MHTML files.
 #[derive(Parser)]
@@ -55,6 +66,10 @@ struct Page {
     output_file: String,
     /// Name within output dir.
     images_dir: String,
+    /// A segment of text from the beginning of the post, stripped of HTML.
+    initial_text: String,
+    /// Paths to thumbnails for images within images_dir.
+    thumbnails: Vec<String>,
 }
 
 #[derive(Default)]
@@ -243,6 +258,33 @@ fn make_output_html_for_post(
     )
 }
 
+fn create_thumbnail(contents: &[u8], thumbnail_path: &std::path::PathBuf) {
+    let reader = image::ImageReader::new(Cursor::new(contents))
+        .with_guessed_format()
+        .unwrap();
+    let image = reader.decode().unwrap();
+    let thumbnail = imageops::thumbnail(&image, 150, 150);
+    image::DynamicImage::ImageRgba8(thumbnail)
+        .into_rgb8()
+        .save(thumbnail_path)
+        .expect("Failed to save");
+}
+
+fn get_initial_text_from_html(html: &String) -> String {
+    static HTML_RE_LOCK: OnceLock<Regex> = OnceLock::new();
+    let html_re = HTML_RE_LOCK.get_or_init(|| Regex::new(r"<[^>]+>").unwrap());
+    let unescaped = htmlize::unescape(utf8_bytes_to_string(
+        &html_re.replace_all(html.as_bytes(), b""),
+    ));
+    let trimmed = unescaped.trim();
+    let (truncated, _) = trimmed.unicode_truncate(INITIAL_TEXT_MAX_LEN);
+    let mut result = truncated.to_string();
+    if result.len() < trimmed.len() {
+        result.push_str("...");
+    }
+    result
+}
+
 fn create_page_from_mhtml(
     path: &std::path::PathBuf,
     output_dir: &std::path::PathBuf,
@@ -303,6 +345,7 @@ Content-Type:\s[^\r\n]+\s*
         return Err(invalid_data_err("MHTML has no data"));
     };
     let post = parse_post_from_mhtml_piece(first_raw_piece)?;
+
     for raw_piece in pieces_iter {
         let piece = parse_mhtml_piece(raw_piece)?;
         if piece.content_type == "image/jpeg" && post.image_urls.contains(&piece.location) {
@@ -313,6 +356,12 @@ Content-Type:\s[^\r\n]+\s*
                 format!("{}/{}", &page.images_dir, &filename),
             );
             fs::write(images_dir.join(&filename), &piece.bytes)?;
+            if num_images <= NUM_THUMBNAILS {
+                let thumbnail_filename = format!("{:03}_thumbnail.jpeg", num_images);
+                create_thumbnail(&piece.bytes, &images_dir.join(&thumbnail_filename));
+                page.thumbnails
+                    .push(format!("{}/{}", page.images_dir, thumbnail_filename));
+            }
         }
     }
     if let Some(post_date) = post.date {
@@ -325,6 +374,7 @@ Content-Type:\s[^\r\n]+\s*
 
     let output_html = make_output_html_for_post(&post, &page, &image_to_path);
     fs::write(output_dir.join(&page.output_file), &output_html.as_bytes())?;
+    page.initial_text = get_initial_text_from_html(&post.html);
 
     Ok(page)
 }
@@ -337,11 +387,18 @@ struct Site {
 fn make_pages_index_html(pages: &Vec<Page>) -> String {
     let mut items: Vec<String> = Vec::new();
     for page in pages {
+        let img_str: String = page
+            .thumbnails
+            .iter()
+            .map(|v| format!("<img src={} style=\"padding-right:5px\">", v))
+            .collect();
         items.push(format!(
-            r#"<li> <a href="{}">{}</a> ({})"#,
+            r#"<li> <b><a href="{}">{}</a></b> (<em>posted {}</em>)<br>{}<br>{} "#,
             page.output_file,
             page.title,
-            page.post_date.format("%b %d, %Y").to_string()
+            page.post_date.format("%b %d, %Y").to_string(),
+            page.initial_text,
+            img_str,
         ));
     }
 
