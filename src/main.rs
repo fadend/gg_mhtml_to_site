@@ -443,7 +443,8 @@ fn create_site_from_mhtml_dir(
         if a.post_date == b.post_date {
             a.title.partial_cmp(&b.title).unwrap()
         } else {
-            a.post_date.partial_cmp(&b.post_date).unwrap()
+            // Put more recent posts first
+            b.post_date.partial_cmp(&a.post_date).unwrap()
         }
     });
     let index_html = make_pages_index_html(&pages);
