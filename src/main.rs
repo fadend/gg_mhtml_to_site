@@ -2,16 +2,16 @@
 //
 // This code focuses on the case where the posts are focused on displaying photos.
 
-use base64::prelude::BASE64_STANDARD;
-use base64::Engine;
+pub mod mhtml;
+pub mod thumbnail;
+pub mod utf8_bytes;
+
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use clap::Parser;
 // Using feature "unescape"
 use htmlize;
-use image;
-use image::imageops;
+
 use lol_html::{element, rewrite_str, RewriteStrSettings};
-use quoted_printable;
 use regex::bytes::Regex;
 use scraper::{Html, Selector};
 // Adds unicode_truncate method to str.
@@ -21,12 +21,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
-use std::io::Cursor;
 use std::sync::OnceLock;
 use std::vec::Vec;
 
 const NUM_THUMBNAILS: i32 = 3;
-const THUMBNAIL_HEIGHT: u32 = 150;
 
 const INITIAL_TEXT_MAX_LEN: usize = 140;
 
@@ -73,35 +71,14 @@ struct Page {
     thumbnails: Vec<String>,
 }
 
-#[derive(Default)]
-struct MhtmlPiece {
-    content_type: String,
-    location: String,
-    bytes: Vec<u8>,
-}
-
 fn calculate_hash<T: Hash>(t: &T) -> u64 {
     let mut s = DefaultHasher::new();
     t.hash(&mut s);
     s.finish()
 }
 
-fn utf8_bytes_to_str(bytes: &[u8]) -> &str {
-    &std::str::from_utf8(bytes).unwrap()
-}
-
-fn utf8_bytes_to_string(bytes: &[u8]) -> String {
-    String::from(utf8_bytes_to_str(bytes))
-}
-
 fn invalid_data_err(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
-}
-
-fn decode_base64_containing_whitespace(data: &[u8]) -> Vec<u8> {
-    let mut copy = Vec::from(data);
-    copy.retain(|b| !b.is_ascii_whitespace());
-    BASE64_STANDARD.decode(copy).unwrap()
 }
 
 fn date_from_title(title: &[u8]) -> Option<NaiveDate> {
@@ -109,9 +86,9 @@ fn date_from_title(title: &[u8]) -> Option<NaiveDate> {
     let date_re = DATE_RE_LOCK
         .get_or_init(|| Regex::new(r#"(?P<month>\d+)/(?P<day>\d+)/(?P<year>\d+)"#).unwrap());
     let captures = date_re.captures(title)?;
-    let year: i32 = utf8_bytes_to_str(&captures["year"]).parse().unwrap();
-    let month: u32 = utf8_bytes_to_str(&captures["month"]).parse().unwrap();
-    let day: u32 = utf8_bytes_to_str(&captures["day"]).parse().unwrap();
+    let year: i32 = utf8_bytes::to_str(&captures["year"]).parse().unwrap();
+    let month: u32 = utf8_bytes::to_str(&captures["month"]).parse().unwrap();
+    let day: u32 = utf8_bytes::to_str(&captures["day"]).parse().unwrap();
     let full_year = if year < 100 { year + 2000 } else { year };
     return NaiveDate::from_ymd_opt(full_year, month, day);
 }
@@ -124,7 +101,7 @@ fn date_from_html(html: &[u8]) -> Option<NaiveDate> {
     });
     let captures = datetime_re.captures(html)?;
     // u202F = NARROW NO-BREAK SPACE
-    let datetime_str = utf8_bytes_to_string(&captures["date"]);
+    let datetime_str = utf8_bytes::to_string(&captures["date"]);
     let (date, _remainder) = NaiveDate::parse_and_remainder(&datetime_str, "%b %d, %Y").unwrap();
     return Some(date);
 }
@@ -132,7 +109,7 @@ fn date_from_html(html: &[u8]) -> Option<NaiveDate> {
 fn parse_groups_post(html: &[u8]) -> Result<GroupsPost, io::Error> {
     let mut post: GroupsPost = Default::default();
     post.date = date_from_html(html);
-    let fragment = Html::parse_fragment(&utf8_bytes_to_str(html));
+    let fragment = Html::parse_fragment(&utf8_bytes::to_str(html));
     let listitem_selector = Selector::parse(r#"section[role="listitem"]"#).unwrap();
     let Some(section) = fragment.select(&listitem_selector).next() else {
         return Err(invalid_data_err("Post has no section[role=listitem]"));
@@ -155,39 +132,7 @@ fn parse_groups_post(html: &[u8]) -> Result<GroupsPost, io::Error> {
     Ok(post)
 }
 
-fn parse_mhtml_piece(text: &[u8]) -> Result<MhtmlPiece, io::Error> {
-    static SECTION_RE_LOCK: OnceLock<Regex> = OnceLock::new();
-    let section_re = SECTION_RE_LOCK.get_or_init(|| {
-        Regex::new(
-            r#"(?x)^Content-Type:\s(?P<content_type>\S+)\s*
-(?:Content-ID:\s\S+\s+)?
-Content-Transfer-Encoding:\s(?P<encoding>\S+)\s*
-Content-Location:\s(?P<location>\S+)\s*"#,
-        )
-        .unwrap()
-    });
-    let Some(captures) = section_re.captures(text) else {
-        println!("Problem parsing: <<{}>>", utf8_bytes_to_str(text));
-        return Err(invalid_data_err("MHTML piece doesn't have expected header"));
-    };
-    let mut piece: MhtmlPiece = Default::default();
-    piece.content_type = utf8_bytes_to_string(&captures["content_type"]);
-    piece.location = utf8_bytes_to_string(&captures["location"]);
-    let remainder = &text[captures.get(0).unwrap().end()..];
-    let encoding = utf8_bytes_to_str(&captures["encoding"]);
-    piece.bytes = match encoding {
-        "base64" => decode_base64_containing_whitespace(remainder),
-        "quoted-printable" => {
-            quoted_printable::decode(remainder, quoted_printable::ParseMode::Strict).unwrap()
-        }
-        _ => panic!("Unknown encoding {} for {}", &encoding, &piece.location),
-    };
-
-    Ok(piece)
-}
-
-fn parse_post_from_mhtml_piece(text: &[u8]) -> Result<GroupsPost, io::Error> {
-    let piece = parse_mhtml_piece(text)?;
+fn parse_post_from_mhtml_piece(piece: &mhtml::MhtmlPiece) -> Result<GroupsPost, io::Error> {
     if piece.content_type != "text/html" {
         return Err(invalid_data_err("Expecting text/html"));
     }
@@ -259,26 +204,10 @@ fn make_output_html_for_post(
     )
 }
 
-fn create_thumbnail(contents: &[u8], thumbnail_path: &std::path::PathBuf) {
-    let reader = image::ImageReader::new(Cursor::new(contents))
-        .with_guessed_format()
-        .unwrap();
-    let image = reader.decode().unwrap();
-    let original_height = image.height();
-    let original_width = image.width();
-    let width =
-        ((original_width as f32) / (original_height as f32) * THUMBNAIL_HEIGHT as f32) as u32;
-    let thumbnail = imageops::thumbnail(&image, width, THUMBNAIL_HEIGHT);
-    image::DynamicImage::ImageRgba8(thumbnail)
-        .into_rgb8()
-        .save(thumbnail_path)
-        .expect("Failed to save");
-}
-
 fn get_initial_text_from_html(html: &String) -> String {
     static HTML_RE_LOCK: OnceLock<Regex> = OnceLock::new();
     let html_re = HTML_RE_LOCK.get_or_init(|| Regex::new(r"<[^>]+>").unwrap());
-    let unescaped = htmlize::unescape(utf8_bytes_to_string(
+    let unescaped = htmlize::unescape(utf8_bytes::to_string(
         &html_re.replace_all(html.as_bytes(), b""),
     ));
     let trimmed = unescaped.trim();
@@ -294,31 +223,12 @@ fn create_page_from_mhtml(
     path: &std::path::PathBuf,
     output_dir: &std::path::PathBuf,
 ) -> Result<Page, io::Error> {
-    static HEADER_RE_LOCK: OnceLock<Regex> = OnceLock::new();
-    let header_re = HEADER_RE_LOCK.get_or_init(|| {
-        Regex::new(
-            r#"(?x)^From:\s[^\r\n]+\s*
-Snapshot-Content-Location:\s(?P<location>[^\r\n]+)\s*
-Subject:\s(?P<subject>[^\r\n]+)\s*
-Date:\s(?<scrape_date>[^\r\n]+)\s*
-MIME-Version:\s[^\r\n]+\s*
-Content-Type:\s[^\r\n]+\s*
-\s+type=[^\r\n]+
-\s+boundary="(?P<boundary>[^"]+)""#,
-        )
-        .unwrap()
-    });
-
     let mut page: Page = Default::default();
-    let contents = fs::read(path)?;
-    let mut contents_slice: &[u8] = &contents;
-    let Some(header_captures) = header_re.captures(contents_slice) else {
-        return Err(invalid_data_err("MHTML doesn't have expected header"));
-    };
-    page.title = utf8_bytes_to_string(&header_captures["subject"]);
-    page.scrape_date =
-        DateTime::parse_from_rfc2822(&utf8_bytes_to_str(&header_captures["scrape_date"])).unwrap();
-    page.original_url = utf8_bytes_to_string(&header_captures["location"]);
+
+    let doc = mhtml::parse(&mut fs::read(path)?)?;
+    page.title = doc.subject;
+    page.scrape_date = doc.date;
+    page.original_url = doc.location;
 
     let mut flattened_title = page.title.replace("/", "_").replace(" ", "_");
     flattened_title.retain(|c| c.is_ascii_alphanumeric() || c == '_');
@@ -331,39 +241,28 @@ Content-Type:\s[^\r\n]+\s*
     page.output_file = format!("{}.html", basename);
     page.images_dir = format!("{}_images", basename);
 
-    // Skip past the header, matched by the Regex.
-    let full_match = header_captures.get(0).unwrap();
-    contents_slice = &contents_slice[full_match.end()..];
-
     let mut image_to_path: HashMap<String, String> = HashMap::new();
     let mut num_images = 0;
     let images_dir = output_dir.join(&page.images_dir);
     fs::create_dir_all(&images_dir)?;
 
-    let mut boundary_pattern: Vec<u8> = Vec::new();
-    header_captures.expand(br#"[\r\n]*-*$boundary-*[\r\n]*"#, &mut boundary_pattern);
-    let boundary_re = Regex::new(&utf8_bytes_to_str(&boundary_pattern)).unwrap();
-
-    let mut pieces_iter = boundary_re.split(contents_slice).filter(|x| !x.is_empty());
-
-    let Some(first_raw_piece) = pieces_iter.next() else {
+    if doc.pieces.is_empty() {
         return Err(invalid_data_err("MHTML has no data"));
     };
-    let post = parse_post_from_mhtml_piece(first_raw_piece)?;
+    let post = parse_post_from_mhtml_piece(&doc.pieces[0])?;
 
-    for raw_piece in pieces_iter {
-        let piece = parse_mhtml_piece(raw_piece)?;
+    for piece in doc.pieces.iter().skip(1) {
         if piece.content_type == "image/jpeg" && post.image_urls.contains(&piece.location) {
             num_images += 1;
             let filename = format!("{:03}.jpeg", num_images);
             image_to_path.insert(
-                piece.location,
+                piece.location.clone(),
                 format!("{}/{}", &page.images_dir, &filename),
             );
             fs::write(images_dir.join(&filename), &piece.bytes)?;
             if num_images <= NUM_THUMBNAILS {
                 let thumbnail_filename = format!("{:03}_thumbnail.jpeg", num_images);
-                create_thumbnail(&piece.bytes, &images_dir.join(&thumbnail_filename));
+                thumbnail::create_thumbnail(&piece.bytes, &images_dir.join(&thumbnail_filename));
                 page.thumbnails
                     .push(format!("{}/{}", page.images_dir, thumbnail_filename));
             }
@@ -371,7 +270,7 @@ Content-Type:\s[^\r\n]+\s*
     }
     if let Some(post_date) = post.date {
         page.post_date = post_date;
-    } else if let Some(title_date) = date_from_title(&header_captures["subject"]) {
+    } else if let Some(title_date) = date_from_title(&page.title.as_bytes()) {
         page.post_date = title_date;
     } else {
         page.post_date = page.scrape_date.naive_local().date();
