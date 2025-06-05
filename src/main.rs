@@ -24,8 +24,6 @@ use std::io;
 use std::sync::OnceLock;
 use std::vec::Vec;
 
-const NUM_THUMBNAILS: i32 = 3;
-
 const INITIAL_TEXT_MAX_LEN: usize = 140;
 
 /// Generate a site from a directory of Google Group MHTML files.
@@ -144,12 +142,15 @@ fn make_output_html_for_post(
     page: &Page,
     image_to_path: &HashMap<String, String>,
 ) -> String {
+    let mut img_count = 0;
     let element_content_handlers = vec![
         // Rewrite image links to point to local copies if available.
         element!("img[src]", |el| {
             let src = el.get_attribute("src").unwrap().replace("&amp;", "&");
             if let Some(path) = image_to_path.get(&src) {
+                img_count += 1;
                 el.set_attribute("src", &path).unwrap();
+                el.set_attribute("id", &format!("img-{img_count}")).unwrap();
             }
 
             Ok(())
@@ -158,7 +159,7 @@ fn make_output_html_for_post(
         element!("*", |el| {
             let attribute_names: Vec<String> = el.attributes().iter().map(|x| x.name()).collect();
             for attribute in attribute_names {
-                if attribute != "href" && attribute != "src" {
+                if attribute != "href" && attribute != "src" && !(el.tag_name() == "img" && attribute == "id") {
                     el.remove_attribute(&attribute.as_str());
                 }
             }
@@ -242,6 +243,7 @@ fn create_page_from_mhtml(
     page.images_dir = format!("{}_images", basename);
 
     let mut image_to_path: HashMap<String, String> = HashMap::new();
+    let mut image_to_thumbnail: HashMap<String, String> = HashMap::new();
     let mut num_images = 0;
     let images_dir = output_dir.join(&page.images_dir);
     fs::create_dir_all(&images_dir)?;
@@ -260,12 +262,17 @@ fn create_page_from_mhtml(
                 format!("{}/{}", &page.images_dir, &filename),
             );
             fs::write(images_dir.join(&filename), &piece.bytes)?;
-            if num_images <= NUM_THUMBNAILS {
-                let thumbnail_filename = format!("{:03}_thumbnail.jpeg", num_images);
-                thumbnail::create_thumbnail(&piece.bytes, &images_dir.join(&thumbnail_filename));
-                page.thumbnails
-                    .push(format!("{}/{}", page.images_dir, thumbnail_filename));
-            }
+            let thumbnail_filename = format!("{:03}_thumbnail.jpeg", num_images);
+            thumbnail::create_thumbnail(&piece.bytes, &images_dir.join(&thumbnail_filename));
+            image_to_thumbnail.insert(
+                piece.location.clone(),
+                format!("{}/{}", page.images_dir, thumbnail_filename),
+            );
+        }
+    }
+    for image_url in &post.image_urls {
+        if let Some(thumbnail_path) = image_to_thumbnail.get(image_url) {
+            page.thumbnails.push(thumbnail_path.clone());
         }
     }
     if let Some(post_date) = post.date {
@@ -291,10 +298,17 @@ struct Site {
 fn make_pages_index_html(pages: &Vec<Page>) -> String {
     let mut items: Vec<String> = Vec::new();
     for page in pages {
+        let mut thumbnail_count = 0;
         let img_str: String = page
             .thumbnails
             .iter()
-            .map(|v| format!("<img src={} style=\"padding-right:5px\">", v))
+            .map(|v| {
+                thumbnail_count += 1;
+                format!(
+                    r#"<a href="{}#img-{}"><img src="{}" style="padding-right:5px"></a>"#,
+                    page.output_file, thumbnail_count, v
+                )
+            })
             .collect();
         items.push(format!(
             r#"<li> <b><a href="{}">{}</a></b> (<em>posted {}</em>)<br>{}<br>{} "#,
