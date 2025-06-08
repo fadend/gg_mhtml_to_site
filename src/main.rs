@@ -159,7 +159,10 @@ fn make_output_html_for_post(
         element!("*", |el| {
             let attribute_names: Vec<String> = el.attributes().iter().map(|x| x.name()).collect();
             for attribute in attribute_names {
-                if attribute != "href" && attribute != "src" && !(el.tag_name() == "img" && attribute == "id") {
+                if attribute != "href"
+                    && attribute != "src"
+                    && !(el.tag_name() == "img" && attribute == "id")
+                {
                     el.remove_attribute(&attribute.as_str());
                 }
             }
@@ -207,10 +210,16 @@ fn make_output_html_for_post(
 
 fn get_initial_text_from_html(html: &String) -> String {
     static HTML_RE_LOCK: OnceLock<Regex> = OnceLock::new();
+    static DOUBLE_SPACE_RE_LOCK: OnceLock<Regex> = OnceLock::new();
+    static SPACE_PUNCTUATION_RE_LOCK: OnceLock<Regex> = OnceLock::new();
     let html_re = HTML_RE_LOCK.get_or_init(|| Regex::new(r"<[^>]+>").unwrap());
-    let unescaped = htmlize::unescape(utf8_bytes::to_string(
-        &html_re.replace_all(html.as_bytes(), b""),
-    ));
+    let double_space_re = DOUBLE_SPACE_RE_LOCK.get_or_init(|| Regex::new(r"\s+").unwrap());
+    let space_punctuation_re = SPACE_PUNCTUATION_RE_LOCK.get_or_init(|| Regex::new(r#" ([,.!:;?])"#).unwrap());
+    // Replace tags with spaces to avoid running visually separated text together.
+    let unescaped = htmlize::unescape(utf8_bytes::to_string(&space_punctuation_re.replace_all(
+        &double_space_re.replace_all(&html_re.replace_all(html.as_bytes(), b" "), b" "),
+        b"$1",
+    )));
     let trimmed = unescaped.trim();
     let (truncated, _) = trimmed.unicode_truncate(INITIAL_TEXT_MAX_LEN);
     let mut result = truncated.to_string();
@@ -407,6 +416,30 @@ mod tests {
         assert_eq!(
             date_from_html(br#"<span class="zX2W9c">Jul 13, 2023, 7:31:18\u{202F}PM</span>"#),
             NaiveDate::from_ymd_opt(2023, 7, 13)
+        );
+    }
+
+    #[test]
+    fn get_initial_text_from_html_empty() {
+        assert_eq!(
+            get_initial_text_from_html(&String::from("")),
+            ""
+        );
+    }
+
+    #[test]
+    fn get_initial_text_from_html_all_spaces() {
+        assert_eq!(
+            get_initial_text_from_html(&String::from(" <p> <span>   </span></p>   ")),
+            ""
+        );
+    }
+
+    #[test]
+    fn get_initial_text_from_html_compress_spaces() {
+        assert_eq!(
+            get_initial_text_from_html(&String::from(" <p>Hi,</p><p>there<b>!</b>")),
+            "Hi, there!"
         );
     }
 }
