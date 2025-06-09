@@ -6,7 +6,7 @@ pub mod mhtml;
 pub mod thumbnail;
 pub mod utf8_bytes;
 
-use chrono::{DateTime, FixedOffset, NaiveDate};
+use chrono::{Datelike, DateTime, FixedOffset, NaiveDate};
 use clap::Parser;
 // Using feature "unescape"
 use htmlize;
@@ -214,7 +214,8 @@ fn get_initial_text_from_html(html: &String) -> String {
     static SPACE_PUNCTUATION_RE_LOCK: OnceLock<Regex> = OnceLock::new();
     let html_re = HTML_RE_LOCK.get_or_init(|| Regex::new(r"<[^>]+>").unwrap());
     let double_space_re = DOUBLE_SPACE_RE_LOCK.get_or_init(|| Regex::new(r"\s+").unwrap());
-    let space_punctuation_re = SPACE_PUNCTUATION_RE_LOCK.get_or_init(|| Regex::new(r#" ([,.!:;?])"#).unwrap());
+    let space_punctuation_re =
+        SPACE_PUNCTUATION_RE_LOCK.get_or_init(|| Regex::new(r#" ([,.!:;?])"#).unwrap());
     // Replace tags with spaces to avoid running visually separated text together.
     let unescaped = htmlize::unescape(utf8_bytes::to_string(&space_punctuation_re.replace_all(
         &double_space_re.replace_all(&html_re.replace_all(html.as_bytes(), b" "), b" "),
@@ -304,46 +305,26 @@ struct Site {
     num_pages: i32,
 }
 
-fn make_pages_index_html(pages: &Vec<Page>) -> String {
-    let mut items: Vec<String> = Vec::new();
-    for page in pages {
-        let mut thumbnail_count = 0;
-        let img_str: String = page
-            .thumbnails
-            .iter()
-            .map(|v| {
-                thumbnail_count += 1;
-                format!(
-                    r#"<a href="{}#img-{}"><img src="{}" style="padding-right:5px"></a>"#,
-                    page.output_file, thumbnail_count, v
-                )
-            })
-            .collect();
-        items.push(format!(
-            r#"<li> <b><a href="{}">{}</a></b> (<em>posted {}</em>)<br>{}<br>{} "#,
-            page.output_file,
-            page.title,
-            page.post_date.format("%b %d, %Y").to_string(),
-            page.initial_text,
-            img_str,
-        ));
-    }
-
+fn make_entry_html(page: &Page) -> String {
+    let mut thumbnail_count = 0;
+    let img_str: String = page
+        .thumbnails
+        .iter()
+        .map(|v| {
+            thumbnail_count += 1;
+            format!(
+                r#"<a href="{}#img-{}"><img src="{}" style="padding-right:5px"></a>"#,
+                page.output_file, thumbnail_count, v
+            )
+        })
+        .collect();
     format!(
-        r#"<!DOCTYPE html>
-    <html lang='en'>
-        <head>
-            <title>Posts Index</title>
-        <meta charset='utf-8'>
-        </head>
-        <body>
-            <h1>Posts Index</h1>
-            <ul>
-                {}
-            </ul>
-        </body>
-    </html>"#,
-        items.join("")
+        r#"<div><b><a href="{}">{}</a></b> (<em>posted {}</em>)<br>{}<br>{}</div>"#,
+        page.output_file,
+        page.title,
+        page.post_date.format("%b %d, %Y").to_string(),
+        page.initial_text,
+        img_str,
     )
 }
 
@@ -369,7 +350,34 @@ fn create_site_from_mhtml_dir(
             b.post_date.partial_cmp(&a.post_date).unwrap()
         }
     });
-    let index_html = make_pages_index_html(&pages);
+    let mut year: i32 = -1;
+    let mut years_index: Vec<String> = Vec::new();
+    let mut items: Vec<String> = Vec::new();
+    for page in pages {
+        if page.post_date.year() != year {
+            year = page.post_date.year();
+            let year_id: String = format!("year-{}", year);
+            years_index.push(format!("<a href=\"#{}\">{}</a>", year_id, year));
+            items.push(format!(r#"<h2 id="{}">{}</h2>"#, year_id, year));
+        }
+        items.push(make_entry_html(&page));
+    }
+    let index_html = format!(
+        r#"<!DOCTYPE html>
+<html lang='en'>
+    <head>
+        <title>Posts Index</title>
+        <meta charset='utf-8'>
+    </head>
+    <body>
+        <h1>Posts Index</h1>
+        {}
+        {}
+    </body>
+</html>"#,
+        years_index.join(" "),
+        items.join("")
+    );
     fs::write(output_dir.join("index.html"), index_html.as_bytes())?;
 
     Ok(site)
@@ -421,10 +429,7 @@ mod tests {
 
     #[test]
     fn get_initial_text_from_html_empty() {
-        assert_eq!(
-            get_initial_text_from_html(&String::from("")),
-            ""
-        );
+        assert_eq!(get_initial_text_from_html(&String::from("")), "");
     }
 
     #[test]
