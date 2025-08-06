@@ -6,7 +6,7 @@ pub mod mhtml;
 pub mod thumbnail;
 pub mod utf8_bytes;
 
-use chrono::{Datelike, DateTime, FixedOffset, NaiveDate};
+use chrono::{DateTime, FixedOffset, NaiveDate};
 use clap::Parser;
 // Using feature "unescape"
 use htmlize;
@@ -14,6 +14,8 @@ use htmlize;
 use lol_html::{element, rewrite_str, RewriteStrSettings};
 use regex::bytes::Regex;
 use scraper::{Html, Selector};
+use serde_derive::Serialize;
+use serde_json;
 // Adds unicode_truncate method to str.
 use unicode_truncate::UnicodeTruncateStr;
 
@@ -50,7 +52,7 @@ struct GroupsPost {
     image_urls: Vec<String>,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize)]
 struct Page {
     title: String,
     /// Date on which the content was scraped.
@@ -305,29 +307,6 @@ struct Site {
     num_pages: i32,
 }
 
-fn make_entry_html(page: &Page) -> String {
-    let mut thumbnail_count = 0;
-    let img_str: String = page
-        .thumbnails
-        .iter()
-        .map(|v| {
-            thumbnail_count += 1;
-            format!(
-                r#"<a href="{}#img-{}"><img src="{}" style="padding-right:5px"></a>"#,
-                page.output_file, thumbnail_count, v
-            )
-        })
-        .collect();
-    format!(
-        r#"<div><b><a href="{}">{}</a></b> (<em>posted {}</em>)<br>{}<br>{}</div>"#,
-        page.output_file,
-        page.title,
-        page.post_date.format("%b %d, %Y").to_string(),
-        page.initial_text,
-        img_str,
-    )
-}
-
 fn create_site_from_mhtml_dir(
     input_dir: &std::path::PathBuf,
     output_dir: &std::path::PathBuf,
@@ -350,35 +329,10 @@ fn create_site_from_mhtml_dir(
             b.post_date.partial_cmp(&a.post_date).unwrap()
         }
     });
-    let mut year: i32 = -1;
-    let mut years_index: Vec<String> = Vec::new();
-    let mut items: Vec<String> = Vec::new();
-    for page in pages {
-        if page.post_date.year() != year {
-            year = page.post_date.year();
-            let year_id: String = format!("year-{}", year);
-            years_index.push(format!("<a href=\"#{}\">{}</a>", year_id, year));
-            items.push(format!(r#"<h2 id="{}">{}</h2>"#, year_id, year));
-        }
-        items.push(make_entry_html(&page));
-    }
-    let index_html = format!(
-        r#"<!DOCTYPE html>
-<html lang='en'>
-    <head>
-        <title>Posts Index</title>
-        <meta charset='utf-8'>
-    </head>
-    <body>
-        <h1>Posts Index</h1>
-        {}
-        {}
-    </body>
-</html>"#,
-        years_index.join(" "),
-        items.join("")
-    );
-    fs::write(output_dir.join("index.html"), index_html.as_bytes())?;
+    fs::write(
+        output_dir.join("posts.json"),
+        serde_json::to_string(&pages)?,
+    )?;
 
     Ok(site)
 }
