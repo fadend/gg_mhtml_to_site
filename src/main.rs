@@ -12,6 +12,7 @@ use clap::Parser;
 use htmlize;
 
 use lol_html::{element, rewrite_str, RewriteStrSettings};
+use regex;
 use regex::bytes::Regex;
 use scraper::{Html, Selector};
 use serde_derive::Serialize;
@@ -20,6 +21,7 @@ use serde_json;
 use unicode_truncate::UnicodeTruncateStr;
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
@@ -50,6 +52,8 @@ struct GroupsPost {
     html: String,
     /// URLs of images used within post_html.
     image_urls: Vec<String>,
+    /// Text contained within i tags, in order of the first unique occurrence.
+    emphasized_text: Vec<String>,
 }
 
 #[derive(Default, Serialize)]
@@ -69,6 +73,7 @@ struct Page {
     initial_text: String,
     /// Paths to thumbnails for images within images_dir.
     thumbnails: Vec<String>,
+    emphasized_text: Vec<String>,
 }
 
 fn calculate_hash<T: Hash>(t: &T) -> u64 {
@@ -91,6 +96,23 @@ fn date_from_title(title: &[u8]) -> Option<NaiveDate> {
     let day: u32 = utf8_bytes::to_str(&captures["day"]).parse().unwrap();
     let full_year = if year < 100 { year + 2000 } else { year };
     return NaiveDate::from_ymd_opt(full_year, month, day);
+}
+
+fn get_text_from_html(html: &String) -> String {
+    static HTML_RE_LOCK: OnceLock<regex::Regex> = OnceLock::new();
+    static MULTI_SPACE_RE_LOCK: OnceLock<regex::Regex> = OnceLock::new();
+    static SPACE_PUNCTUATION_RE_LOCK: OnceLock<regex::Regex> = OnceLock::new();
+    let html_re = HTML_RE_LOCK.get_or_init(|| regex::Regex::new(r"<[^>]+>").unwrap());
+    let multi_space_re = MULTI_SPACE_RE_LOCK.get_or_init(|| regex::Regex::new(r"\s+").unwrap());
+    let space_punctuation_re =
+        SPACE_PUNCTUATION_RE_LOCK.get_or_init(|| regex::Regex::new(r#" ([,.!:;?])"#).unwrap());
+    // Replace tags with spaces to avoid running visually separated text together.
+    let stripped = html_re.replace_all(html, " ");
+    // Compress runs of spaces.
+    let compressed = multi_space_re.replace_all(&stripped, " ");
+    // Strip spaces before certain punctuation marks.
+    let despaced = space_punctuation_re.replace_all(&compressed, "$1");
+    return htmlize::unescape(despaced).trim().to_string();
 }
 
 fn date_from_html(html: &[u8]) -> Option<NaiveDate> {
@@ -121,6 +143,15 @@ fn parse_groups_post(html: &[u8]) -> Result<GroupsPost, io::Error> {
     let Some(region) = section.select(&region_selector).next() else {
         return Err(invalid_data_err("Post has no [role=region]"));
     };
+    let mut emphasized_texts = HashSet::<String>::new();
+    let i_selector = Selector::parse("i").unwrap();
+    for i_tag in region.select(&i_selector) {
+        let text: String = get_text_from_html(&i_tag.inner_html());
+        if !emphasized_texts.contains(&text) {
+            post.emphasized_text.push(text.clone());
+            emphasized_texts.insert(text.clone());
+        }
+    }
     let img_selector = Selector::parse("img").unwrap();
     for img in region.select(&img_selector) {
         if let Some(src) = img.attr("src") {
@@ -137,6 +168,27 @@ fn parse_post_from_mhtml_piece(piece: &mhtml::MhtmlPiece) -> Result<GroupsPost, 
         return Err(invalid_data_err("Expecting text/html"));
     }
     return parse_groups_post(&piece.bytes);
+}
+
+// This is a hack to workaround lol_html not supporting (?) rewriting tags based on their
+// contained text.
+fn rewrite_i_tags(post: &GroupsPost, html: &String) -> String {
+    static I_RE_LOCK: OnceLock<regex::Regex> = OnceLock::new();
+    let html_re = I_RE_LOCK.get_or_init(|| regex::Regex::new(r"<i>(.*?)</i>").unwrap());
+    let mut i_texts: HashSet<String> = HashSet::from_iter(post.emphasized_text.iter().cloned());
+    let mut i_count = 0;
+    return html_re
+        .replace_all(html, |caps: &regex::Captures| {
+            let raw_text = caps.get(1).unwrap().as_str();
+            let text = get_text_from_html(&String::from(raw_text));
+            if i_texts.remove(&text) {
+                i_count += 1;
+                return format!("<i id=\"i-{}\">{}</i>", i_count, raw_text);
+            } else {
+                return String::from(caps.get(0).unwrap().as_str());
+            }
+        })
+        .to_string();
 }
 
 fn make_output_html_for_post(
@@ -202,7 +254,7 @@ fn make_output_html_for_post(
         </p>
     </body>
 </html>"#,
-        post_html = output_post_html,
+        post_html = rewrite_i_tags(post, &output_post_html),
         title = page.title,
         info = info_pieces.join(", "),
         scrape_date = page.scrape_date,
@@ -211,22 +263,10 @@ fn make_output_html_for_post(
 }
 
 fn get_initial_text_from_html(html: &String) -> String {
-    static HTML_RE_LOCK: OnceLock<Regex> = OnceLock::new();
-    static DOUBLE_SPACE_RE_LOCK: OnceLock<Regex> = OnceLock::new();
-    static SPACE_PUNCTUATION_RE_LOCK: OnceLock<Regex> = OnceLock::new();
-    let html_re = HTML_RE_LOCK.get_or_init(|| Regex::new(r"<[^>]+>").unwrap());
-    let double_space_re = DOUBLE_SPACE_RE_LOCK.get_or_init(|| Regex::new(r"\s+").unwrap());
-    let space_punctuation_re =
-        SPACE_PUNCTUATION_RE_LOCK.get_or_init(|| Regex::new(r#" ([,.!:;?])"#).unwrap());
-    // Replace tags with spaces to avoid running visually separated text together.
-    let unescaped = htmlize::unescape(utf8_bytes::to_string(&space_punctuation_re.replace_all(
-        &double_space_re.replace_all(&html_re.replace_all(html.as_bytes(), b" "), b" "),
-        b"$1",
-    )));
-    let trimmed = unescaped.trim();
-    let (truncated, _) = trimmed.unicode_truncate(INITIAL_TEXT_MAX_LEN);
+    let text = get_text_from_html(html);
+    let (truncated, _) = text.unicode_truncate(INITIAL_TEXT_MAX_LEN);
     let mut result = truncated.to_string();
-    if result.len() < trimmed.len() {
+    if result.len() < text.len() {
         result.push_str("...");
     }
     result
@@ -298,6 +338,7 @@ fn create_page_from_mhtml(
     let output_html = make_output_html_for_post(&post, &page, &image_to_path);
     fs::write(output_dir.join(&page.output_file), &output_html.as_bytes())?;
     page.initial_text = get_initial_text_from_html(&post.html);
+    page.emphasized_text = post.emphasized_text;
 
     Ok(page)
 }
