@@ -26,6 +26,7 @@ use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::sync::OnceLock;
+use std::thread;
 use std::vec::Vec;
 
 const INITIAL_TEXT_MAX_LEN: usize = 140;
@@ -353,19 +354,24 @@ fn create_site_from_mhtml_dir(
     output_dir: &std::path::PathBuf,
 ) -> Result<Site, io::Error> {
     let mut site = Site { num_pages: 0 };
-    let mut pages: Vec<Page> = Vec::new();
-    let paths: Vec<std::path::PathBuf> = fs::read_dir(input_dir)?
-        .filter(|wrapper| {
-            wrapper
-                .as_ref()
-                .is_ok_and(|entry| entry.file_name().to_str().unwrap().ends_with(".mhtml"))
-        })
-        .map(|wrapper| wrapper.unwrap().path())
-        .collect();
-    site.num_pages = paths.len() as i32;
-    for path in paths {
-        println!("Processing {:?}", path);
-        pages.push(create_page_from_mhtml(&path, output_dir)?);
+    let mut pages: Vec<Page> = vec![];
+    let mut threads = vec![];
+    for entry in fs::read_dir(input_dir)? {
+        let entry = entry?;
+        if entry.file_name().to_str().unwrap().ends_with(".mhtml") {
+            let path = entry.path();
+            println!("Processing {:?}", path);
+            let my_output_dir = output_dir.clone();
+            threads.push(thread::spawn(move || -> Result<Page, io::Error> {
+                create_page_from_mhtml(&path, &my_output_dir)
+            }));
+        }
+    }
+
+    site.num_pages = threads.len() as i32;
+
+    for t in threads {
+        pages.push(t.join().unwrap()?)
     }
     pages.sort_by(|a, b| {
         if a.post_date == b.post_date {
