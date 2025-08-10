@@ -11,12 +11,14 @@ use clap::Parser;
 // Using feature "unescape"
 use htmlize;
 
+use flume;
 use lol_html::{element, rewrite_str, RewriteStrSettings};
 use regex;
 use regex::bytes::Regex;
 use scraper::{Html, Selector};
 use serde_derive::Serialize;
 use serde_json;
+use threadpool;
 // Adds unicode_truncate method to str.
 use unicode_truncate::UnicodeTruncateStr;
 
@@ -26,7 +28,6 @@ use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::sync::OnceLock;
-use std::thread;
 use std::vec::Vec;
 
 const INITIAL_TEXT_MAX_LEN: usize = 140;
@@ -346,33 +347,36 @@ fn create_page_from_mhtml(
 
 struct Site {
     /// Number of pages generated from posts.
-    num_pages: i32,
+    num_pages: usize,
 }
 
 fn create_site_from_mhtml_dir(
     input_dir: &std::path::PathBuf,
     output_dir: &std::path::PathBuf,
 ) -> Result<Site, io::Error> {
-    let mut site = Site { num_pages: 0 };
-    let mut pages: Vec<Page> = vec![];
-    let mut threads = vec![];
+    let mut num_pages = 0;
+    // TODO: make the number of workers configurable.
+    let pool = threadpool::ThreadPool::new(5);
+    let (sender, receiver) = flume::unbounded();
     for entry in fs::read_dir(input_dir)? {
         let entry = entry?;
         if entry.file_name().to_str().unwrap().ends_with(".mhtml") {
+            num_pages += 1;
             let path = entry.path();
             println!("Processing {:?}", path);
             let my_output_dir = output_dir.clone();
-            threads.push(thread::spawn(move || -> Result<Page, io::Error> {
-                create_page_from_mhtml(&path, &my_output_dir)
-            }));
+            let sender = sender.clone();
+            pool.execute(move || {
+                sender.send(create_page_from_mhtml(&path, &my_output_dir)).unwrap();
+            });
         }
     }
-
-    site.num_pages = threads.len() as i32;
-
-    for t in threads {
-        pages.push(t.join().unwrap()?)
+    let mut pages: Vec<Page> = vec![];
+    for result in receiver.iter().take(num_pages) {
+        pages.push(result?);
     }
+    pool.join();
+
     pages.sort_by(|a, b| {
         if a.post_date == b.post_date {
             a.title.partial_cmp(&b.title).unwrap()
@@ -386,7 +390,7 @@ fn create_site_from_mhtml_dir(
         serde_json::to_string(&pages)?,
     )?;
 
-    Ok(site)
+    Ok(Site{ num_pages: num_pages})
 }
 
 fn main() {
