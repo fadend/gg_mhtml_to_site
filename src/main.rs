@@ -354,13 +354,18 @@ fn create_site_from_mhtml_dir(
 ) -> Result<Site, io::Error> {
     let mut site = Site { num_pages: 0 };
     let mut pages: Vec<Page> = Vec::new();
-    for entry in fs::read_dir(input_dir)? {
-        let entry = entry?;
-        if entry.file_name().to_str().unwrap().ends_with(".mhtml") {
-            println!("Processing {:?}", &entry.path());
-            pages.push(create_page_from_mhtml(&entry.path(), output_dir)?);
-            site.num_pages += 1;
-        }
+    let paths: Vec<std::path::PathBuf> = fs::read_dir(input_dir)?
+        .filter(|wrapper| {
+            wrapper
+                .as_ref()
+                .is_ok_and(|entry| entry.file_name().to_str().unwrap().ends_with(".mhtml"))
+        })
+        .map(|wrapper| wrapper.unwrap().path())
+        .collect();
+    site.num_pages = paths.len() as i32;
+    for path in paths {
+        println!("Processing {:?}", path);
+        pages.push(create_page_from_mhtml(&path, output_dir)?);
     }
     pages.sort_by(|a, b| {
         if a.post_date == b.post_date {
