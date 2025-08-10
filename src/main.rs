@@ -367,7 +367,9 @@ fn create_site_from_mhtml_dir(
             let my_output_dir = output_dir.clone();
             let sender = sender.clone();
             pool.execute(move || {
-                sender.send(create_page_from_mhtml(&path, &my_output_dir)).unwrap();
+                sender
+                    .send(create_page_from_mhtml(&path, &my_output_dir))
+                    .unwrap();
             });
         }
     }
@@ -390,7 +392,9 @@ fn create_site_from_mhtml_dir(
         serde_json::to_string(&pages)?,
     )?;
 
-    Ok(Site{ num_pages: num_pages})
+    Ok(Site {
+        num_pages: num_pages,
+    })
 }
 
 fn main() {
