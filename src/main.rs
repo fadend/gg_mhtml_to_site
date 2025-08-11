@@ -54,8 +54,8 @@ struct GroupsPost {
     html: String,
     /// URLs of images used within post_html.
     image_urls: Vec<String>,
-    /// Text contained within i tags, in order of the first unique occurrence.
-    emphasized_text: Vec<String>,
+    /// Text from i tags, in order of first unique appearance.
+    i_text: Vec<String>,
 }
 
 #[derive(Default, Serialize)]
@@ -75,7 +75,8 @@ struct Page {
     initial_text: String,
     /// Paths to thumbnails for images within images_dir.
     thumbnails: Vec<String>,
-    emphasized_text: Vec<String>,
+    /// Text from i tags, in order of first unique appearance.
+    i_text: Vec<String>,
 }
 
 fn calculate_hash<T: Hash>(t: &T) -> u64 {
@@ -130,6 +131,30 @@ fn date_from_html(html: &[u8]) -> Option<NaiveDate> {
     return Some(date);
 }
 
+fn rewrite_i_tags(html: &String, i_texts: &mut Vec<String>) -> String {
+    static REPEATED_I_RE_LOCK: OnceLock<regex::Regex> = OnceLock::new();
+    static I_RE_LOCK: OnceLock<regex::Regex> = OnceLock::new();
+    // Find sequences of one or more i tags. We'll merge them.
+    let repeated_i_re = REPEATED_I_RE_LOCK
+        .get_or_init(|| regex::Regex::new(r#"(<i>.*?</i>(\s|&nbsp;)*)+"#).unwrap());
+    // Identify start/end i tags.
+    let i_re = I_RE_LOCK.get_or_init(|| regex::Regex::new(r#"</?i>"#).unwrap());
+    let mut known_i_texts: HashSet<String> = HashSet::new();
+    return repeated_i_re
+        .replace_all(html, |caps: &regex::Captures| {
+            let i_html = caps.get(0).unwrap().as_str();
+            let output_html = format!("<i>{}</i>", i_re.replace_all(i_html, ""));
+            let text = get_text_from_html(&String::from(output_html.clone()));
+            // If we get a true value when attempting to add it to the set, that means
+            // it was unknown previously.
+            if known_i_texts.insert(text.clone()) {
+                i_texts.push(text.clone());
+            }
+            return output_html;
+        })
+        .to_string();
+}
+
 fn parse_groups_post(html: &[u8]) -> Result<GroupsPost, io::Error> {
     let mut post: GroupsPost = Default::default();
     post.date = date_from_html(html);
@@ -145,15 +170,6 @@ fn parse_groups_post(html: &[u8]) -> Result<GroupsPost, io::Error> {
     let Some(region) = section.select(&region_selector).next() else {
         return Err(invalid_data_err("Post has no [role=region]"));
     };
-    let mut emphasized_texts = HashSet::<String>::new();
-    let i_selector = Selector::parse("i").unwrap();
-    for i_tag in region.select(&i_selector) {
-        let text: String = get_text_from_html(&i_tag.inner_html());
-        if !emphasized_texts.contains(&text) {
-            post.emphasized_text.push(text.clone());
-            emphasized_texts.insert(text.clone());
-        }
-    }
     let img_selector = Selector::parse("img").unwrap();
     for img in region.select(&img_selector) {
         if let Some(src) = img.attr("src") {
@@ -161,7 +177,7 @@ fn parse_groups_post(html: &[u8]) -> Result<GroupsPost, io::Error> {
                 .push(String::from(src).replace("&amp;", "&"));
         }
     }
-    post.html = region.inner_html();
+    post.html = rewrite_i_tags(&region.inner_html(), &mut post.i_text);
     Ok(post)
 }
 
@@ -170,27 +186,6 @@ fn parse_post_from_mhtml_piece(piece: &mhtml::MhtmlPiece) -> Result<GroupsPost, 
         return Err(invalid_data_err("Expecting text/html"));
     }
     return parse_groups_post(&piece.bytes);
-}
-
-// This is a hack to workaround lol_html not supporting (?) rewriting tags based on their
-// contained text.
-fn rewrite_i_tags(post: &GroupsPost, html: &String) -> String {
-    static I_RE_LOCK: OnceLock<regex::Regex> = OnceLock::new();
-    let html_re = I_RE_LOCK.get_or_init(|| regex::Regex::new(r"<i>(.*?)</i>").unwrap());
-    let mut i_texts: HashSet<String> = HashSet::from_iter(post.emphasized_text.iter().cloned());
-    let mut i_count = 0;
-    return html_re
-        .replace_all(html, |caps: &regex::Captures| {
-            let raw_text = caps.get(1).unwrap().as_str();
-            let text = get_text_from_html(&String::from(raw_text));
-            if i_texts.remove(&text) {
-                i_count += 1;
-                return format!("<i id=\"i-{}\">{}</i>", i_count, raw_text);
-            } else {
-                return String::from(caps.get(0).unwrap().as_str());
-            }
-        })
-        .to_string();
 }
 
 fn make_output_html_for_post(
@@ -256,7 +251,7 @@ fn make_output_html_for_post(
         </p>
     </body>
 </html>"#,
-        post_html = rewrite_i_tags(post, &output_post_html),
+        post_html = output_post_html,
         title = page.title,
         info = info_pieces.join(", "),
         scrape_date = page.scrape_date,
@@ -340,7 +335,7 @@ fn create_page_from_mhtml(
     let output_html = make_output_html_for_post(&post, &page, &image_to_path);
     fs::write(output_dir.join(&page.output_file), &output_html.as_bytes())?;
     page.initial_text = get_initial_text_from_html(&post.html);
-    page.emphasized_text = post.emphasized_text;
+    page.i_text = post.i_text;
 
     Ok(page)
 }
@@ -460,5 +455,24 @@ mod tests {
             get_initial_text_from_html(&String::from(" <p>Hi,</p><p>there<b>!</b>")),
             "Hi, there!"
         );
+    }
+
+    #[test]
+    fn rewrite_i_tags_space_separated() {
+        let mut i_texts: Vec<String> = vec![];
+        let html = rewrite_i_tags(
+            &String::from("<i>hi</i> <i>there</i><br><i>hi there</i>"),
+            &mut i_texts,
+        );
+        assert_eq!(i_texts, vec!["hi there"]);
+        assert_eq!(html, "<i>hi there</i><br><i>hi there</i>");
+    }
+
+    #[test]
+    fn rewrite_i_tags_with_nbsp() {
+        let mut i_texts: Vec<String> = vec![];
+        let html = rewrite_i_tags(&String::from("<i>hi</i>&nbsp;<i>there</i>"), &mut i_texts);
+        assert_eq!(i_texts, vec!["hi\u{a0}there"]);
+        assert_eq!(html, "<i>hi&nbsp;there</i>");
     }
 }
