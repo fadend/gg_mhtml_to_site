@@ -358,7 +358,6 @@ fn create_site_from_mhtml_dir(
         if entry.file_name().to_str().unwrap().ends_with(".mhtml") {
             num_pages += 1;
             let path = entry.path();
-            println!("Processing {:?}", path);
             let my_output_dir = output_dir.clone();
             let sender = sender.clone();
             pool.execute(move || {
