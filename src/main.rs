@@ -31,6 +31,8 @@ use std::sync::OnceLock;
 use std::vec::Vec;
 
 const INITIAL_TEXT_MAX_LEN: usize = 140;
+const MIN_I_TEXT_LEN: usize = 3;
+const MAX_I_TEXT_LEN: usize = 50;
 
 /// Generate a site from a directory of Google Group MHTML files.
 #[derive(Parser)]
@@ -145,10 +147,19 @@ fn rewrite_i_tags(html: &String, i_texts: &mut Vec<String>) -> String {
             let i_html = caps.get(0).unwrap().as_str();
             let output_html = format!("<i>{}</i>", i_re.replace_all(i_html, ""));
             let text = get_text_from_html(&String::from(output_html.clone()));
-            // If we get a true value when attempting to add it to the set, that means
-            // it was unknown previously.
-            if known_i_texts.insert(text.clone()) {
-                i_texts.push(text.clone());
+            // Without the explict return, rustfmt is stripping away the curly braces, which
+            // in turn causes the `||` operator to get interpreted as introducing another
+            // closure.
+            let text = String::from(text.trim_matches(|c: char| {
+                return c.is_ascii_punctuation() || c.is_ascii_whitespace();
+            }));
+            let text_len = text.len();
+            if text_len >= MIN_I_TEXT_LEN && text_len <= MAX_I_TEXT_LEN {
+                // If we get a true value when attempting to add it to the set, that means
+                // it was unknown previously.
+                if known_i_texts.insert(text.clone()) {
+                    i_texts.push(text.clone());
+                }
             }
             return output_html;
         })
