@@ -88,7 +88,7 @@ Content-Type:\s[^\r\n]+\s*
         return Err(invalid_data_err("MHTML doesn't have expected header"));
     };
     doc.subject = utf8_bytes::to_string(&header_captures["subject"]);
-    doc.date = DateTime::parse_from_rfc2822(&utf8_bytes::to_str(&header_captures["date"])).unwrap();
+    doc.date = DateTime::parse_from_rfc2822(utf8_bytes::to_str(&header_captures["date"])).unwrap();
     doc.location = utf8_bytes::to_string(&header_captures["location"]);
 
     // Skip past the header, matched by the Regex.
@@ -97,7 +97,7 @@ Content-Type:\s[^\r\n]+\s*
 
     let mut boundary_pattern: Vec<u8> = Vec::new();
     header_captures.expand(br#"[\r\n]*-*$boundary-*[\r\n]*"#, &mut boundary_pattern);
-    let boundary_re = Regex::new(&utf8_bytes::to_str(&boundary_pattern)).unwrap();
+    let boundary_re = Regex::new(utf8_bytes::to_str(&boundary_pattern)).unwrap();
 
     for raw_piece in boundary_re.split(contents_slice).filter(|x| !x.is_empty()) {
         doc.pieces.push(self::parse_mhtml_piece(raw_piece)?);

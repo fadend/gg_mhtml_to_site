@@ -9,16 +9,11 @@ pub mod utf8_bytes;
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use clap::Parser;
 // Using feature "unescape"
-use htmlize;
 
-use flume;
 use lol_html::{element, rewrite_str, RewriteStrSettings};
-use regex;
 use regex::bytes::Regex;
 use scraper::{Html, Selector};
 use serde_derive::Serialize;
-use serde_json;
-use threadpool;
 // Adds unicode_truncate method to str.
 use unicode_truncate::UnicodeTruncateStr;
 
@@ -100,7 +95,7 @@ fn date_from_title(title: &[u8]) -> Option<NaiveDate> {
     let month: u32 = utf8_bytes::to_str(&captures["month"]).parse().unwrap();
     let day: u32 = utf8_bytes::to_str(&captures["day"]).parse().unwrap();
     let full_year = if year < 100 { year + 2000 } else { year };
-    return NaiveDate::from_ymd_opt(full_year, month, day);
+    NaiveDate::from_ymd_opt(full_year, month, day)
 }
 
 fn get_text_from_html(html: &String) -> String {
@@ -117,7 +112,7 @@ fn get_text_from_html(html: &String) -> String {
     let compressed = multi_space_re.replace_all(&stripped, " ");
     // Strip spaces before certain punctuation marks.
     let despaced = space_punctuation_re.replace_all(&compressed, "$1");
-    return htmlize::unescape(despaced).trim().to_string();
+    htmlize::unescape(despaced).trim().to_string()
 }
 
 fn date_from_html(html: &[u8]) -> Option<NaiveDate> {
@@ -130,7 +125,7 @@ fn date_from_html(html: &[u8]) -> Option<NaiveDate> {
     // u202F = NARROW NO-BREAK SPACE
     let datetime_str = utf8_bytes::to_string(&captures["date"]);
     let (date, _remainder) = NaiveDate::parse_and_remainder(&datetime_str, "%b %d, %Y").unwrap();
-    return Some(date);
+    Some(date)
 }
 
 fn rewrite_i_tags(html: &String, i_texts: &mut Vec<String>) -> String {
@@ -142,34 +137,34 @@ fn rewrite_i_tags(html: &String, i_texts: &mut Vec<String>) -> String {
     // Identify start/end i tags.
     let i_re = I_RE_LOCK.get_or_init(|| regex::Regex::new(r#"</?i>"#).unwrap());
     let mut known_i_texts: HashSet<String> = HashSet::new();
-    return repeated_i_re
+    repeated_i_re
         .replace_all(html, |caps: &regex::Captures| {
             let i_html = caps.get(0).unwrap().as_str();
             let output_html = format!("<i>{}</i>", i_re.replace_all(i_html, ""));
-            let text = get_text_from_html(&String::from(output_html.clone()));
+            let text = get_text_from_html(&output_html.clone());
             // Without the explict return, rustfmt is stripping away the curly braces, which
             // in turn causes the `||` operator to get interpreted as introducing another
             // closure.
             let text = String::from(text.trim_matches(|c: char| {
-                return c.is_ascii_punctuation() || c.is_ascii_whitespace();
+                c.is_ascii_punctuation() || c.is_ascii_whitespace()
             }));
             let text_len = text.len();
-            if text_len >= MIN_I_TEXT_LEN && text_len <= MAX_I_TEXT_LEN {
+            if (MIN_I_TEXT_LEN..=MAX_I_TEXT_LEN).contains(&text_len) {
                 // If we get a true value when attempting to add it to the set, that means
                 // it was unknown previously.
                 if known_i_texts.insert(text.clone()) {
                     i_texts.push(text.clone());
                 }
             }
-            return output_html;
+            output_html
         })
-        .to_string();
+        .to_string()
 }
 
 fn parse_groups_post(html: &[u8]) -> Result<GroupsPost, io::Error> {
     let mut post: GroupsPost = Default::default();
     post.date = date_from_html(html);
-    let fragment = Html::parse_fragment(&utf8_bytes::to_str(html));
+    let fragment = Html::parse_fragment(utf8_bytes::to_str(html));
     let listitem_selector = Selector::parse(r#"section[role="listitem"]"#).unwrap();
     let Some(section) = fragment.select(&listitem_selector).next() else {
         return Err(invalid_data_err("Post has no section[role=listitem]"));
@@ -196,7 +191,7 @@ fn parse_post_from_mhtml_piece(piece: &mhtml::MhtmlPiece) -> Result<GroupsPost, 
     if piece.content_type != "text/html" {
         return Err(invalid_data_err("Expecting text/html"));
     }
-    return parse_groups_post(&piece.bytes);
+    parse_groups_post(&piece.bytes)
 }
 
 fn make_output_html_for_post(
@@ -211,7 +206,7 @@ fn make_output_html_for_post(
             let src = el.get_attribute("src").unwrap().replace("&amp;", "&");
             if let Some(path) = image_to_path.get(&src) {
                 img_count += 1;
-                el.set_attribute("src", &path).unwrap();
+                el.set_attribute("src", path).unwrap();
                 el.set_attribute("id", &format!("img-{img_count}")).unwrap();
             }
 
@@ -225,7 +220,7 @@ fn make_output_html_for_post(
                     && attribute != "src"
                     && !(el.tag_name() == "img" && attribute == "id")
                 {
-                    el.remove_attribute(&attribute.as_str());
+                    el.remove_attribute(attribute.as_str());
                 }
             }
 
@@ -233,7 +228,7 @@ fn make_output_html_for_post(
         }),
     ];
     let output_post_html = rewrite_str(
-        &post.html.as_str(),
+        post.html.as_str(),
         RewriteStrSettings {
             element_content_handlers,
             ..RewriteStrSettings::new()
@@ -337,14 +332,14 @@ fn create_page_from_mhtml(
     }
     if let Some(post_date) = post.date {
         page.post_date = post_date;
-    } else if let Some(title_date) = date_from_title(&page.title.as_bytes()) {
+    } else if let Some(title_date) = date_from_title(page.title.as_bytes()) {
         page.post_date = title_date;
     } else {
         page.post_date = page.scrape_date.naive_local().date();
     }
 
     let output_html = make_output_html_for_post(&post, &page, &image_to_path);
-    fs::write(output_dir.join(&page.output_file), &output_html.as_bytes())?;
+    fs::write(output_dir.join(&page.output_file), output_html.as_bytes())?;
     page.initial_text = get_initial_text_from_html(&post.html);
     page.i_text = post.i_text;
 
@@ -398,7 +393,7 @@ fn create_site_from_mhtml_dir(
     )?;
 
     Ok(Site {
-        num_pages: num_pages,
+        num_pages,
     })
 }
 
